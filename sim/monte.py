@@ -5,17 +5,21 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation  # (unused in this script, but handy)
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (needed for 3D projection)
 
+from system_model import *
+import particle_filter
+
+
 # =========================
 # Global Config / Constants
 # =========================
 np.random.seed(69)
 
 # Monte Carlo
-NUM_MONTE_RUNS = 50
+NUM_MONTE_RUNS = 5
 
-simulation_time = 50  # seconds
-simulation_hz = 200   # integrator rate (dt = 1/simulation_hz)
-sim_dt = 1 / simulation_hz
+sim_time = 50  # seconds
+sim_hz = 200   # integrator rate (dt = 1/simulation_hz)
+sim_dt = 1 / sim_hz
 
 
 # =========================
@@ -119,36 +123,36 @@ def make_ellipsoid_accel_provider(rx, ry, rz, w_th, w_ph, th0=0.0, ph0=0.0, nois
 # Monte Carlo Trajectory Generation
 # ====================================
 def generate_trajectories():
+    monte_state = []
+    monte_acc   = []
 
-    trajectories = []
     for _ in range(NUM_MONTE_RUNS):
-        rx = 40.0  # x semi-axis
-        ry = 40.0  # y semi-axis
-        rz = 10.0  # z semi-axis
-
+        rx, ry, rz = 40.0, 40.0, 10.0
         w_th = np.random.uniform(0.05, 0.2)
         w_ph = np.random.uniform(0.05, 0.2)
         th0  = np.random.uniform(-np.pi/4, np.pi/4)
         ph0  = np.random.uniform(0, 2*np.pi)
 
-        accel_fn, x0 = make_ellipsoid_accel_provider(rx, ry, rz, w_th, w_ph, th0, ph0, noise_std=0.05)
+        accel_fn, x0 = make_ellipsoid_accel_provider(
+            rx, ry, rz, w_th, w_ph, th0, ph0, noise_std=0.05
+        )
 
-        tmp = runge_kutta(rover_x_dot, x0,
-                          t_0=0.0, t_f=simulation_time,
-                          dt=1.0/simulation_hz,
-                          accel_fn=accel_fn)
-        trajectories.append(tmp)
-    return trajectories
+        res = runge_kutta(
+            rover_x_dot, x0,
+            t_0=0.0, t_f=sim_time,
+            dt=1.0/sim_hz,
+            accel_fn=accel_fn
+        )
 
-def add_process_noise_to_trajectories(trajectories):
-    """
-    Optional: injects additional zero-mean Gaussian process noise into stored histories.
-    """
-    for i, run_hash in enumerate(trajectories):
-        run_hash['state_sum'] += np.random.normal(0, np.sqrt(process_noise_variance), size=run_hash['state_sum'].shape)
-        run_hash['acc_sum']   += np.random.normal(0, np.sqrt(process_noise_variance), size=run_hash['acc_sum'].shape)
-        trajectories[i] = run_hash
-    return trajectories
+        # pull from dict returned by integrator
+        monte_state.append(res['state_sum'])  # (T, 6)
+        monte_acc.append(res['acc_sum'])      # (T, 3)
+
+    monte_data = {
+        'state_sum': np.stack(monte_state, axis=0),  # (R, T, 6)
+        'acc_sum':   np.stack(monte_acc,   axis=0),  # (R, T, 3)
+    }
+    return monte_data
 
 # =========================
 # Plotting
@@ -174,14 +178,58 @@ def plot_trajectories(trajectories, fig_num=1, save_as_png=False, dpi=300):
 
     plt.show()
 
+def plot_pf_xyz_rmse_all_runs(monte_data):
+    """
+    Assumes matching time axes:
+      monte_data['x_estimate'] : (R, T, NUM_STATES) or (T, NUM_STATES)
+      monte_data['state_sum']  : (R, T, 6)          or (T, 6)
+    Returns:
+      rmse_axes_per_run : (R, 3)  # [x_rmse, y_rmse, z_rmse] per run
+    """
+    X = np.asarray(monte_data['x_estimate'])   # (R, T, NS) or (T, NS)
+    S = np.asarray(monte_data['state_sum'])    # (R, T, 6)  or (T, 6)
+
+    # force (R, T, ...)
+    if X.ndim == 2: X = X[None, ...]
+    if S.ndim == 2: S = S[None, ...]
+    R, T_x, _ = X.shape
+    R2, T_s, _ = S.shape
+    assert R == R2, "Runs mismatch"
+    assert T_x == T_s, "PF and truth must have same timestep count for this plot"
+
+    pos_est  = X[:, :, :3]             # (R, T, 3)
+    pos_true = S[:, :, :3]             # (R, T, 3)
+    err = pos_est - pos_true           # (R, T, 3)
+
+    # per-run, per-axis RMSE: sqrt(mean_t(err_axis^2))
+    rmse_axes_per_run = np.sqrt(np.mean(err**2, axis=1))  # (R, 3)
+
+    # plot grouped bars: x/y/z for each run
+    x = np.arange(R)
+    width = 0.27
+    plt.figure()
+    plt.bar(x - width, rmse_axes_per_run[:, 0], width, label='x RMSE')
+    plt.bar(x,         rmse_axes_per_run[:, 1], width, label='y RMSE')
+    plt.bar(x + width, rmse_axes_per_run[:, 2], width, label='z RMSE')
+    plt.xlabel('Run')
+    plt.ylabel('Position RMSE')
+    plt.title('PF Position RMSE per Run (x, y, z)')
+    plt.xticks(x, [str(i) for i in range(R)])
+    plt.grid(True, axis='y', alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    return rmse_axes_per_run
+
+
 # =========================
 # Main
 # =========================
 if __name__ == "__main__":
 
     monte_data = generate_trajectories()
+    #plot_trajectories(monte_data, fig_num=1, save_as_png=False, dpi=300)
 
-    # Optional: add extra process noise (comment out if you want clean paths)
-    # rover_trajectories = add_process_noise_to_rover_trajectories(rover_trajectories)
-
-    plot_trajectories(monte_data, fig_num=1, save_as_png=False, dpi=300)
+    monte_data = particle_filter.run_pf_for_all_runs(monte_data)
+    plot_pf_xyz_rmse_all_runs(monte_data)

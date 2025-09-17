@@ -11,7 +11,7 @@ measurement_noise_variance = 0.125
 # Rates
 imu_hz = 100         # IMU update/logging rate (can be different from integrator)
 pf_dt = 1 / imu_hz
-ranging_hz = 20
+ranging_hz = 100
 
 # Beacons
 CENTER = np.array([0.0, 0.0, 1.0])  # central beacon at (0,0,1)
