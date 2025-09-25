@@ -7,7 +7,7 @@ from system_model import *
 
 
 # Particle Filter Constants
-NUM_PARTICLES = 10000
+NUM_PARTICLES = 500
 PERCENT_EFFECTIVE = 0.4
 NUM_EFFECTIVE_THRESHOLD = int( NUM_PARTICLES * PERCENT_EFFECTIVE )
 
@@ -23,7 +23,7 @@ def pf_init():
 # takes in particles & accelerametor measurement & gives back the new state of particles
 def prediction_step(x_k, u_k):
     
-    return A @ x_k + (B @ u_k)[:, None] + np.random.normal(0, np.sqrt(process_noise_variance))
+    return A @ x_k + (B @ u_k)[:, None] + B @ np.random.normal(0.0, np.sqrt(process_noise_variance), size=(3, x_k.shape[1]))
 
 def update_step(sensor_measurement, x_k, w_k):
     """
@@ -39,10 +39,6 @@ def update_step(sensor_measurement, x_k, w_k):
 
     # measurement noise: scalar or per-beacon
     sigma = np.sqrt(np.asarray(measurement_noise_variance, float))
-    if sigma.ndim == 0:
-        sigma = np.full(BEACONS.shape[0], float(sigma))
-    sigma = sigma[:, None]                               # (M, 1) for broadcasting
-
     # per-beacon likelihoods -> (M, N)
     lk_per = norm.pdf(sensor_measurement[:, None], loc=d_hat, scale=sigma)
 
@@ -177,6 +173,8 @@ def run_pf_for_all_runs(monte_data):
 
         # init (t = 0)
         x_k_all[r, 0], w_k_all[r, 0] = pf_init()
+        x0 = S_all[r, 0, :]
+        x_k_all[r, 0] = np.repeat(x0[:, None], NUM_PARTICLES, axis=1)   # (6, Np)
         x_est_all[r, 0] = x_k_all[r, 0] @ w_k_all[r, 0]
 
         pf_idx = 1
@@ -200,6 +198,9 @@ def run_pf_for_all_runs(monte_data):
                 z, x_k_all[r, pf_idx], w_k_all[r, pf_idx - 1]
             )
 
+            #if pf_idx > 20:
+            #    import pdb; pdb.set_trace()
+#
             #_ = plot_pred_update_step(
             #                              truth_pos=traj[s, :3],
             #                              x_pred=x_pred_dbg, w_pred=w_pred_dbg,

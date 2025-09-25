@@ -25,7 +25,7 @@ sim_dt = 1 / sim_hz
 # =========================
 # Dynamics & Integrator
 # =========================
-def rover_x_dot(x_n, acceleration_n):
+def drone_x_dot(x_n, acceleration_n):
     """
     6-state continuous-time dynamics:
       x = [x, y, z, vx, vy, vz]
@@ -127,18 +127,18 @@ def generate_trajectories():
     monte_acc   = []
 
     for _ in range(NUM_MONTE_RUNS):
-        rx, ry, rz = 25.0, 25.0, 10.0
+        rx, ry, rz = 6.0, 6.0, 2.0
         w_th = np.random.uniform(0.05, 0.2)
         w_ph = np.random.uniform(0.05, 0.2)
         th0  = np.random.uniform(-np.pi/4, np.pi/4)
         ph0  = np.random.uniform(0, 2*np.pi)
 
         accel_fn, x0 = make_ellipsoid_accel_provider(
-            rx, ry, rz, w_th, w_ph, th0, ph0, noise_std=0.05
+            rx, ry, rz, w_th, w_ph, th0, ph0
         )
 
         res = runge_kutta(
-            rover_x_dot, x0,
+            drone_x_dot, x0,
             t_0=0.0, t_f=sim_time,
             dt=1.0/sim_hz,
             accel_fn=accel_fn
