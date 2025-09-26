@@ -11,14 +11,61 @@ NUM_PARTICLES = 500
 PERCENT_EFFECTIVE = 0.4
 NUM_EFFECTIVE_THRESHOLD = int( NUM_PARTICLES * PERCENT_EFFECTIVE )
 
-x_0_std = 20
+pos_0_std = 0.25
+vel_0_std = 0.5
 
-def pf_init():
 
+def pf_init(sensor_measurement):
+    """
+    Initialize PF particles given a single UWB range measurement.
+
+    Args:
+        sensor_measurement : float, measured range to anchor
+
+    Returns:
+        x_0_all : (NUM_STATES, NUM_PARTICLES)
+        w_0_all : (NUM_PARTICLES,)
+    """
     x_0_all = np.zeros((NUM_STATES, NUM_PARTICLES))
-    x_0_all[0:3, :] = np.random.normal(0.0, x_0_std, size=(3, NUM_PARTICLES))
-    return x_0_all, np.full(NUM_PARTICLES, 1.0/NUM_PARTICLES)
 
+    # --- sample radii around the measured distance ---
+    radii = np.random.normal(sensor_measurement, pos_0_std, size=NUM_PARTICLES)
+    radii = np.clip(radii, 0.1, None)  # avoid negative/zero
+
+    # --- sample directions in spherical cap (facing -y into the room) ---
+    theta = np.arccos(1 - np.random.rand(NUM_PARTICLES) * (1 - np.cos(np.deg2rad(60))))  # half-angle ~60°
+    phi = np.random.uniform(0.0, 2.0*np.pi, size=NUM_PARTICLES)  # full azimuth range
+
+    # unit vectors
+    ux = np.sin(theta) * np.cos(phi)
+    uy = -np.abs(np.cos(theta))   # bias directions into -y
+    uz = np.sin(theta) * np.sin(phi)
+    dirs = np.vstack((ux, uy, uz))
+
+    # --- particle positions ---
+    pos = BEACONS[0][:, None] + radii * dirs
+
+    # enforce indoor bounds (resample if out of bounds)
+    for i in range(NUM_PARTICLES):
+        while not (X_LIM[0] <= pos[0, i] <= X_LIM[1] and
+                   Y_LIM[0] <= pos[1, i] <= Y_LIM[1] and
+                   Z_LIM[0] <= pos[2, i] <= Z_LIM[1]):
+            r = np.random.normal(sensor_measurement, pos_0_std)
+            t = np.arccos(1 - np.random.rand() * (1 - np.cos(np.deg2rad(60))))
+            p = np.random.uniform(0.0, 2.0*np.pi)
+            u = np.array([
+                np.sin(t) * np.cos(p),
+                -np.abs(np.cos(t)),
+                np.sin(t) * np.sin(p)
+            ])
+            pos[:, i] = BEACONS[0] + r * u
+
+    # --- set state array ---
+    x_0_all[0:3, :] = pos
+    x_0_all[3:, :] = np.random.normal(0.0, vel_0_std, size=(3, NUM_PARTICLES))
+
+    # --- uniform weights ---
+    return x_0_all, np.full(NUM_PARTICLES, 1.0 / NUM_PARTICLES)
 
 # takes in particles & accelerametor measurement & gives back the new state of particles
 def prediction_step(x_k, u_k):
@@ -67,20 +114,39 @@ def update_step(sensor_measurement, x_k, w_k):
 
 def plot_pred_update_step(truth_pos, x_pred, w_pred, x_post, w_post, step_idx=None):
     """
-    Debug one PF step: compare prediction vs update and show beacons (XY).
+    Debug one PF step in 3D: compare prediction vs update and show beacons.
       truth_pos : (3,) true [x,y,z] at this time
       x_pred    : (NUM_STATES, N) particles AFTER prediction (prior)
       w_pred    : (N,)           weights BEFORE update   (prior)
       x_post    : (NUM_STATES, N) particles AFTER update (posterior)
       w_post    : (N,)           weights AFTER update    (posterior)
-    Uses global BEACONS = (M,3).
+    Uses global BEACONS = (M,3). Uses X_LIM/Y_LIM/Z_LIM if present.
     """
     def _norm(w):
+        w = np.asarray(w).astype(float)
         s = np.sum(w)
         return (np.ones_like(w)/w.size) if (not np.isfinite(s) or s <= 0) else (w/s)
 
-    w_pred = _norm(np.asarray(w_pred))
-    w_post = _norm(np.asarray(w_post))
+    def _sizes(w):
+        w = w / (w.max() + 1e-12)
+        return 6.0 + 120.0 * w
+
+    def _set_bounds(ax):
+        try:
+            ax.set_xlim(X_LIM[0], X_LIM[1])
+            ax.set_ylim(Y_LIM[0], Y_LIM[1])
+            ax.set_zlim(Z_LIM[0], Z_LIM[1])
+        except Exception:
+            # fallback: auto data bounds with padding
+            all_pts = np.column_stack([pos_pred, pos_post, truth_pos.reshape(3,1)])
+            mn = all_pts.min(axis=1); mx = all_pts.max(axis=1)
+            pad = 0.05 * (mx - mn + 1e-6)
+            ax.set_xlim(mn[0]-pad[0], mx[0]+pad[0])
+            ax.set_ylim(mn[1]-pad[1], mx[1]+pad[1])
+            ax.set_zlim(mn[2]-pad[2], mx[2]+pad[2])
+
+    w_pred = _norm(w_pred)
+    w_post = _norm(w_post)
 
     pos_pred = x_pred[0:3, :]   # (3, N)
     pos_post = x_post[0:3, :]   # (3, N)
@@ -91,43 +157,41 @@ def plot_pred_update_step(truth_pos, x_pred, w_pred, x_post, w_post, step_idx=No
     e_pred = np.linalg.norm(mu_pred - truth_pos)
     e_post = np.linalg.norm(mu_post - truth_pos)
 
-    def _sizes(w):
-        w = w / (w.max() + 1e-12)
-        return 10.0 + 120.0 * w
-
-    # beacons (XY)
-    beacons_xy = None
+    B = None
     if 'BEACONS' in globals():
         B = np.asarray(BEACONS)
-        if B.ndim == 2 and B.shape[1] >= 2:
-            beacons_xy = B[:, :2]
+        if B.ndim != 2 or B.shape[1] < 3:
+            B = None
 
-    fig, axs = plt.subplots(1, 2, figsize=(10, 4), constrained_layout=True)
+    fig = plt.figure(figsize=(12, 5), constrained_layout=True)
+    ax1 = fig.add_subplot(1, 2, 1, projection='3d')
+    ax2 = fig.add_subplot(1, 2, 2, projection='3d')
 
-    # PRIOR
-    axs[0].scatter(pos_pred[0], pos_pred[1], s=_sizes(w_pred), alpha=0.35, label='particles')
-    axs[0].scatter([truth_pos[0]], [truth_pos[1]], marker='*', s=140, label='truth', zorder=5)
-    axs[0].scatter([mu_pred[0]], [mu_pred[1]], marker='o', s=70, label='mean', zorder=5)
-    if beacons_xy is not None:
-        axs[0].scatter(beacons_xy[:,0], beacons_xy[:,1], marker='X', s=90, label='beacons', zorder=6)
-        # annotate beacon indices
-        for i, (bx, by) in enumerate(beacons_xy):
-            axs[0].text(bx, by, f'B{i}', ha='left', va='bottom', fontsize=8)
-    axs[0].set_title(f'Prediction (prior){"" if step_idx is None else f" | step {step_idx}"}\n‖mean error‖={e_pred:.3g}')
-    axs[0].set_xlabel('x'); axs[0].set_ylabel('y'); axs[0].grid(True, alpha=0.3); axs[0].legend()
-    axs[0].set_aspect('equal', 'box')
+    # PRIOR (3D)
+    ax1.scatter(pos_pred[0], pos_pred[1], pos_pred[2], s=_sizes(w_pred), alpha=0.28, label='particles')
+    ax1.scatter([truth_pos[0]], [truth_pos[1]], [truth_pos[2]], marker='*', s=160, label='truth', zorder=5)
+    ax1.scatter([mu_pred[0]], [mu_pred[1]], [mu_pred[2]], marker='o', s=80, label='mean', zorder=6)
+    if B is not None:
+        ax1.scatter(B[:,0], B[:,1], B[:,2], marker='X', s=100, label='beacons', zorder=7)
+        for i, (bx, by, bz) in enumerate(B):
+            ax1.text(bx, by, bz, f'B{i}', fontsize=8, ha='left', va='bottom')
 
-    # POSTERIOR
-    axs[1].scatter(pos_post[0], pos_post[1], s=_sizes(w_post), alpha=0.35, label='particles')
-    axs[1].scatter([truth_pos[0]], [truth_pos[1]], marker='*', s=140, label='truth', zorder=5)
-    axs[1].scatter([mu_post[0]], [mu_post[1]], marker='o', s=70, label='mean', zorder=5)
-    if beacons_xy is not None:
-        axs[1].scatter(beacons_xy[:,0], beacons_xy[:,1], marker='X', s=90, label='beacons', zorder=6)
-        for i, (bx, by) in enumerate(beacons_xy):
-            axs[1].text(bx, by, f'B{i}', ha='left', va='bottom', fontsize=8)
-    axs[1].set_title(f'Update (posterior){"" if step_idx is None else f" | step {step_idx}"}\n‖mean error‖={e_post:.3g}')
-    axs[1].set_xlabel('x'); axs[1].set_ylabel('y'); axs[1].grid(True, alpha=0.3); axs[1].legend()
-    axs[1].set_aspect('equal', 'box')
+    ax1.set_title(f'Prediction (prior){"" if step_idx is None else f" | step {step_idx}"}\n‖mean error‖={e_pred:.3g}')
+    ax1.set_xlabel('x'); ax1.set_ylabel('y'); ax1.set_zlabel('z'); ax1.grid(True, alpha=0.3); ax1.legend(loc='upper left')
+    _set_bounds(ax1)
+
+    # POSTERIOR (3D)
+    ax2.scatter(pos_post[0], pos_post[1], pos_post[2], s=_sizes(w_post), alpha=0.28, label='particles')
+    ax2.scatter([truth_pos[0]], [truth_pos[1]], [truth_pos[2]], marker='*', s=160, label='truth', zorder=5)
+    ax2.scatter([mu_post[0]], [mu_post[1]], [mu_post[2]], marker='o', s=80, label='mean', zorder=6)
+    if B is not None:
+        ax2.scatter(B[:,0], B[:,1], B[:,2], marker='X', s=100, label='beacons', zorder=7)
+        for i, (bx, by, bz) in enumerate(B):
+            ax2.text(bx, by, bz, f'B{i}', fontsize=8, ha='left', va='bottom')
+
+    ax2.set_title(f'Update (posterior){"" if step_idx is None else f" | step {step_idx}"}\n‖mean error‖={e_post:.3g}')
+    ax2.set_xlabel('x'); ax2.set_ylabel('y'); ax2.set_zlabel('z'); ax2.grid(True, alpha=0.3); ax2.legend(loc='upper left')
+    _set_bounds(ax2)
 
     plt.show()
 
@@ -172,9 +236,7 @@ def run_pf_for_all_runs(monte_data):
         acc  = A_all[r]     # (T_sim, 3)
 
         # init (t = 0)
-        x_k_all[r, 0], w_k_all[r, 0] = pf_init()
-        x0 = S_all[r, 0, :]
-        x_k_all[r, 0] = np.repeat(x0[:, None], NUM_PARTICLES, axis=1)   # (6, Np)
+        x_k_all[r, 0], w_k_all[r, 0] = pf_init(np.linalg.norm( traj[0, :3] - BEACONS[0] ))
         x_est_all[r, 0] = x_k_all[r, 0] @ w_k_all[r, 0]
 
         pf_idx = 1
@@ -201,12 +263,12 @@ def run_pf_for_all_runs(monte_data):
             #if pf_idx > 20:
             #    import pdb; pdb.set_trace()
 #
-            #_ = plot_pred_update_step(
-            #                              truth_pos=traj[s, :3],
-            #                              x_pred=x_pred_dbg, w_pred=w_pred_dbg,
-            #                              x_post=x_k_all[r, pf_idx], w_post=w_k_all[r, pf_idx],
-            #                              step_idx=pf_idx
-            #                          )
+            _ = plot_pred_update_step(
+                                          truth_pos=traj[s, :3],
+                                          x_pred=x_pred_dbg, w_pred=w_pred_dbg,
+                                          x_post=x_k_all[r, pf_idx], w_post=w_k_all[r, pf_idx],
+                                          step_idx=pf_idx
+                                      )
 
             # State estimate as weighted mean
             x_est_all[r, pf_idx] = x_k_all[r, pf_idx] @ w_k_all[r, pf_idx]

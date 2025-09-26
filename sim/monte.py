@@ -127,7 +127,7 @@ def generate_trajectories():
     monte_acc   = []
 
     for _ in range(NUM_MONTE_RUNS):
-        rx, ry, rz = 6.0, 6.0, 2.0
+        rx, ry, rz = 12.0, 12.0, 6.0
         w_th = np.random.uniform(0.05, 0.2)
         w_ph = np.random.uniform(0.05, 0.2)
         th0  = np.random.uniform(-np.pi/4, np.pi/4)
@@ -177,7 +177,6 @@ def plot_trajectories(trajectories, fig_num=1, save_as_png=False, dpi=300):
         plt.savefig('rover_trajectories.png', format='png', dpi=dpi)
 
     plt.show()
-
 
 def plot_pf_xyz_est_vs_truth(monte_data, run_idx=0, sim_hz=None, imu_hz=None):
     """
