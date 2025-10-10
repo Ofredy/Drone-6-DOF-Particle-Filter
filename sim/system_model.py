@@ -5,26 +5,29 @@ import numpy as np
 NUM_STATES = 6  # [x, y, z, vx, vy, vz]
 
 # Noise / process config
-process_noise_variance = 0.0025 # optional extra noise if you use add_process_noise()
-measurement_noise_variance = 0.0225
+process_noise_std = 0.0025
+process_noise_variance = np.sqrt(process_noise_std)
+measurement_noise_std = 0.01
+measurement_noise_variance = np.sqrt(measurement_noise_std)
 
 # Rates
-imu_hz = 100         # IMU update/logging rate (can be different from integrator)
+imu_hz = 40         # IMU update/logging rate (can be different from integrator)
 pf_dt = 1 / imu_hz
-ranging_hz = 100
+ranging_hz = 10
 
 # Beacons
 CENTER = np.array([0.0,  0.0,  1.0]) # central of drone movement(0,0,1)
 BEACONS = np.array([
-    [0.0,  25.0,  2.5],  
-    #[-25.0, -25.0,  0.0],
-    #[25.0, -25.0,  5.0],
+    [0.0,    15.0,  0.0],  
+    [-15.0, -15.0,  5.0],
+    [15.0,  -15.0,  10.0],
+    #[  0.0,  -8.3, 25.0],  # new high anchor
 ], dtype=float)
 
 # Indoor Space Definition
-X_LIM = [ -25.0, 25.0 ]
-Y_LIM = [ -25.0, 25.0 ]
-Z_LIM = [ -10.0, 10.0 ]
+X_LIM = [ -15.0, 15.0 ]
+Y_LIM = [ -15.0, 15.0 ]
+Z_LIM = [   0.0, 10.0 ]
 
 A = np.array([
                 [1, 0, 0, pf_dt,      0,      0],

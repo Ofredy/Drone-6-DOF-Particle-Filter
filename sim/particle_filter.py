@@ -5,72 +5,111 @@ import matplotlib.pyplot as plt
 from monte import sim_hz
 from system_model import *
 
-
 # Particle Filter Constants
 NUM_PARTICLES = 500
-PERCENT_EFFECTIVE = 0.4
+PERCENT_EFFECTIVE = 0.2
 NUM_EFFECTIVE_THRESHOLD = int( NUM_PARTICLES * PERCENT_EFFECTIVE )
+
+_rng = np.random.default_rng()
+BETA = 0.6
+REJUVENATION_SCALE = 0.25
 
 pos_0_std = 0.25
 vel_0_std = 0.5
 
 
-def pf_init(sensor_measurement):
+def pf_init():
     """
-    Initialize PF particles given a single UWB range measurement.
-
-    Args:
-        sensor_measurement : float, measured range to anchor
+    Initialize PF particles uniformly within the room bounds.
+    Ignores any measurement; use this when you want a pure room-uniform prior.
 
     Returns:
         x_0_all : (NUM_STATES, NUM_PARTICLES)
         w_0_all : (NUM_PARTICLES,)
     """
+    # Positions: uniform across the room
+    x = np.random.uniform(X_LIM[0], X_LIM[1], size=NUM_PARTICLES)
+    y = np.random.uniform(Y_LIM[0], Y_LIM[1], size=NUM_PARTICLES)
+    z = np.random.uniform(Z_LIM[0], Z_LIM[1], size=NUM_PARTICLES)
+    pos = np.vstack([x, y, z])  # (3, N)
+
+    # Velocities: small Gaussian around 0
+    vx = np.random.normal(0.0, vel_0_std, size=NUM_PARTICLES)
+    vy = np.random.normal(0.0, vel_0_std, size=NUM_PARTICLES)
+    vz = np.random.normal(0.0, vel_0_std, size=NUM_PARTICLES)
+
+    # State stack
     x_0_all = np.zeros((NUM_STATES, NUM_PARTICLES))
-
-    # --- sample radii around the measured distance ---
-    radii = np.random.normal(sensor_measurement, pos_0_std, size=NUM_PARTICLES)
-    radii = np.clip(radii, 0.1, None)  # avoid negative/zero
-
-    # --- sample directions in spherical cap (facing -y into the room) ---
-    theta = np.arccos(1 - np.random.rand(NUM_PARTICLES) * (1 - np.cos(np.deg2rad(60))))  # half-angle ~60°
-    phi = np.random.uniform(0.0, 2.0*np.pi, size=NUM_PARTICLES)  # full azimuth range
-
-    # unit vectors
-    ux = np.sin(theta) * np.cos(phi)
-    uy = -np.abs(np.cos(theta))   # bias directions into -y
-    uz = np.sin(theta) * np.sin(phi)
-    dirs = np.vstack((ux, uy, uz))
-
-    # --- particle positions ---
-    pos = BEACONS[0][:, None] + radii * dirs
-
-    # enforce indoor bounds (resample if out of bounds)
-    for i in range(NUM_PARTICLES):
-        while not (X_LIM[0] <= pos[0, i] <= X_LIM[1] and
-                   Y_LIM[0] <= pos[1, i] <= Y_LIM[1] and
-                   Z_LIM[0] <= pos[2, i] <= Z_LIM[1]):
-            r = np.random.normal(sensor_measurement, pos_0_std)
-            t = np.arccos(1 - np.random.rand() * (1 - np.cos(np.deg2rad(60))))
-            p = np.random.uniform(0.0, 2.0*np.pi)
-            u = np.array([
-                np.sin(t) * np.cos(p),
-                -np.abs(np.cos(t)),
-                np.sin(t) * np.sin(p)
-            ])
-            pos[:, i] = BEACONS[0] + r * u
-
-    # --- set state array ---
     x_0_all[0:3, :] = pos
-    x_0_all[3:, :] = np.random.normal(0.0, vel_0_std, size=(3, NUM_PARTICLES))
+    x_0_all[3,   :] = vx
+    x_0_all[4,   :] = vy
+    x_0_all[5,   :] = vz
 
-    # --- uniform weights ---
-    return x_0_all, np.full(NUM_PARTICLES, 1.0 / NUM_PARTICLES)
+    # Uniform weights
+    w_0_all = np.full(NUM_PARTICLES, 1.0 / NUM_PARTICLES)
+    return x_0_all, w_0_all
 
 # takes in particles & accelerametor measurement & gives back the new state of particles
 def prediction_step(x_k, u_k):
     
     return A @ x_k + (B @ u_k)[:, None] + B @ np.random.normal(0.0, np.sqrt(process_noise_variance), size=(3, x_k.shape[1]))
+
+def jitter_particles_diag(X, process_noise_variance, kappa=0.3, rng=_rng):
+    """
+    Rejuvenation for diagonal Q:
+      Q = diag(process_noise_variance), where process_noise_variance can be:
+        - scalar (same variance for all states), or
+        - (d,) array for per-state variance.
+    Adds Gaussian noise: N(0, kappa * Q) to each particle.
+    """
+    X = np.asarray(X, dtype=np.float64)
+    d, N = X.shape
+
+    # Normalize variance to per-state vector
+    if np.isscalar(process_noise_variance):
+        var_vec = float(process_noise_variance) * np.ones(d, dtype=np.float64)
+    else:
+        var_vec = np.asarray(process_noise_variance, dtype=np.float64)
+        if var_vec.shape != (d,):
+            raise ValueError(f"process_noise_variance must be scalar or shape ({d},), got {var_vec.shape}")
+
+    std_vec = np.sqrt(np.maximum(0.0, kappa) * np.maximum(var_vec, 0.0))  # ensure non-neg
+    noise = rng.standard_normal(size=(d, N)) * std_vec[:, None]           # broadcast per-state std
+    return X + noise
+
+def residual_resample(weights, rng=_rng):
+    """
+    Residual resampling (low variance):
+    - Deterministically allocate floor(N * w_i) copies.
+    - Multinomial draw the remaining R copies from residual probs.
+    Returns: indices (N,)
+    """
+    w = np.asarray(weights, dtype=np.float64)
+    w_sum = w.sum()
+    if w_sum <= 0 or not np.isfinite(w_sum):
+        # fallback: uniform
+        N = len(w)
+        return rng.integers(low=0, high=N, size=N, endpoint=False)
+
+    w = w / w_sum
+    N = w.size
+
+    Ns = np.floor(N * w).astype(int)          # integer copy counts
+    R = N - Ns.sum()                           # how many left to draw
+    idx = np.repeat(np.arange(N), Ns)          # deterministic part
+
+    if R > 0:
+        residual = N * w - Ns                  # fractional leftovers
+        res_sum = residual.sum()
+        if res_sum > 0 and np.isfinite(res_sum):
+            p = residual / res_sum
+        else:
+            p = np.full(N, 1.0 / N)
+        idx_res = rng.choice(N, size=R, replace=True, p=p)
+        idx = np.concatenate([idx, idx_res])
+
+    rng.shuffle(idx)                           # avoid ordering bias
+    return idx
 
 def update_step(sensor_measurement, x_k, w_k):
     """
@@ -93,7 +132,7 @@ def update_step(sensor_measurement, x_k, w_k):
     lk = np.prod(np.maximum(lk_per, 1e-300), axis=0)
 
     # weight update (elementwise) + robust normalize
-    w_k = w_k * lk
+    w_k = w_k * (lk ** BETA)
     s = w_k.sum()
     if not np.isfinite(s) or s <= 0.0:
         w_k = np.full_like(w_k, 1.0 / w_k.size)
@@ -103,12 +142,11 @@ def update_step(sensor_measurement, x_k, w_k):
     # resample if needed (systematic)
     eff_particles = 1.0 / np.sum(w_k**2)
     if eff_particles <= NUM_EFFECTIVE_THRESHOLD:
-        cdf = np.cumsum(w_k); cdf[-1] = 1.0
-        u0 = np.random.rand() / NUM_PARTICLES
-        u = u0 + (np.arange(NUM_PARTICLES) / NUM_PARTICLES)
-        idx = np.searchsorted(cdf, u, side='left')
+        # --- residual resampling ---
+        idx = residual_resample(w_k)
         x_k = x_k[:, idx]
-        w_k = np.full(NUM_PARTICLES, 1.0 / NUM_PARTICLES)
+        w_k = np.full(NUM_PARTICLES, 1.0 / NUM_PARTICLES, dtype=np.float64)
+        x_k = jitter_particles_diag(x_k, process_noise_variance, kappa=REJUVENATION_SCALE)
 
     return x_k, w_k
 
@@ -221,10 +259,14 @@ def run_pf_for_all_runs(monte_data):
     Runs, T_sim, _ = S_all.shape
 
     # PF update every 'step_div' sim ticks
-    step_div = int(sim_hz // imu_hz)
-    if step_div < 1:
+    step_div_imu = int(sim_hz // imu_hz)
+    if step_div_imu < 1:
         raise ValueError("imu_hz must be <= sim_hz and yield an integer ratio for this path.")
-    T_pf = 1 + (T_sim - 1) // step_div   # include t=0
+    T_pf = 1 + (T_sim - 1) // step_div_imu   # include t=0
+
+    step_div_rng = int(sim_hz // ranging_hz)
+    if step_div_rng < 1 or not np.isclose(sim_hz, step_div_rng * ranging_hz):
+        raise ValueError("ranging_hz must be <= sim_hz and divide it evenly.")
 
     # Allocate
     x_k_all = np.zeros((Runs, T_pf, NUM_STATES, NUM_PARTICLES))
@@ -232,17 +274,18 @@ def run_pf_for_all_runs(monte_data):
     x_est_all = np.zeros((Runs, T_pf, NUM_STATES))
 
     for r in range(Runs):
+        print("run: %d/%d" % (r, Runs))
         traj = S_all[r]     # (T_sim, 6)
         acc  = A_all[r]     # (T_sim, 3)
 
         # init (t = 0)
-        x_k_all[r, 0], w_k_all[r, 0] = pf_init(np.linalg.norm( traj[0, :3] - BEACONS[0] ))
+        x_k_all[r, 0], w_k_all[r, 0] = pf_init()
         x_est_all[r, 0] = x_k_all[r, 0] @ w_k_all[r, 0]
 
         pf_idx = 1
         for s in range(1, T_sim):
             # only update PF on IMU ticks
-            if (s % step_div) != 0:
+            if (s % step_div_imu) != 0:
                 continue
 
             # Prediction with current acceleration sample
@@ -256,19 +299,24 @@ def run_pf_for_all_runs(monte_data):
             )
 
             # Measurement update (your update_step returns (x_k_new, w_k_new))
-            x_k_all[r, pf_idx], w_k_all[r, pf_idx] = update_step(
-                z, x_k_all[r, pf_idx], w_k_all[r, pf_idx - 1]
-            )
+            if ( s % step_div_rng ) == 0:
+                x_k_all[r, pf_idx], w_k_all[r, pf_idx] = update_step(
+                    z, x_k_all[r, pf_idx], w_k_all[r, pf_idx - 1]
+                )
+
+                #_ = plot_pred_update_step(
+                #                              truth_pos=traj[s, :3],
+                #                              x_pred=x_pred_dbg, w_pred=w_pred_dbg,
+                #                              x_post=x_k_all[r, pf_idx], w_post=w_k_all[r, pf_idx],
+                #                              step_idx=pf_idx
+                #                          )
+
+            else:
+                # no update this tick: carry weights forward
+                w_k_all[r, pf_idx] = w_k_all[r, pf_idx - 1]
 
             #if pf_idx > 20:
             #    import pdb; pdb.set_trace()
-#
-            _ = plot_pred_update_step(
-                                          truth_pos=traj[s, :3],
-                                          x_pred=x_pred_dbg, w_pred=w_pred_dbg,
-                                          x_post=x_k_all[r, pf_idx], w_post=w_k_all[r, pf_idx],
-                                          step_idx=pf_idx
-                                      )
 
             # State estimate as weighted mean
             x_est_all[r, pf_idx] = x_k_all[r, pf_idx] @ w_k_all[r, pf_idx]

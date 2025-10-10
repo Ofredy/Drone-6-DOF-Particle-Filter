@@ -1,3 +1,4 @@
+import os
 from collections import deque  # (kept if you later want to animate)
 
 import numpy as np
@@ -15,9 +16,9 @@ import particle_filter
 np.random.seed(69)
 
 # Monte Carlo
-NUM_MONTE_RUNS = 1
+NUM_MONTE_RUNS = 100
 
-sim_time = 50  # seconds
+sim_time = 150  # seconds
 sim_hz = 200   # integrator rate (dt = 1/simulation_hz)
 sim_dt = 1 / sim_hz
 
@@ -73,32 +74,27 @@ def runge_kutta(get_x_dot, x_0, t_0, t_f, dt, accel_fn):
 # Ellipsoid Reference Motion (Center)
 # ====================================
 def ellipsoid_pos_vel_acc(t, rx, ry, rz, w_th, w_ph, th0=0.0, ph0=0.0):
-    """
-    Ellipsoid param:
-      x = rx cosθ cosφ
-      y = ry cosθ sinφ
-      z = rz sinθ
-    θ(t) = th0 + w_th t,  φ(t) = ph0 + w_ph t
-    """
     th = th0 + w_th * t
     ph = ph0 + w_ph * t
     cth, sth = np.cos(th), np.sin(th)
     cph, sph = np.cos(ph), np.sin(ph)
 
-    # position (relative to center)
+    # position
     x = rx * cth * cph
     y = ry * cth * sph
-    z = rz * sth
 
-    # velocities (θ', φ' constants)
+    # map raw z into [0, 10] — NO additional zero-at-t0 shift
+    z = (rz * sth + rz) * (10.0 / (2.0 * rz))
+
+    # velocities
     vx = -rx * sth * cph * w_th - rx * cth * sph * w_ph
     vy = -ry * sth * sph * w_th + ry * cth * cph * w_ph
-    vz =  rz * cth * w_th
+    vz =  rz * cth * w_th * (10.0 / (2.0 * rz))
 
-    # accelerations (θ'', φ'' = 0)
+    # accelerations
     ax = -rx * cth * cph * (w_th**2 + w_ph**2) + 2 * rx * sth * sph * w_th * w_ph
     ay = -ry * cth * sph * (w_th**2 + w_ph**2) - 2 * ry * sth * cph * w_th * w_ph
-    az = -rz * sth * (w_th**2)
+    az = -rz * sth * (w_th**2) * (10.0 / (2.0 * rz))
 
     pos = np.array([x, y, z])
     vel = np.array([vx, vy, vz])
@@ -161,17 +157,18 @@ def plot_trajectories(trajectories, fig_num=1, save_as_png=False, dpi=300):
     fig = plt.figure(fig_num)
     ax = fig.add_subplot(111, projection='3d')
 
-    # plot the beacon at the center
     ax.scatter([CENTER[0]], [CENTER[1]], [CENTER[2]], s=80, marker='X', label='Beacon', zorder=5)
 
-    # plot each Monte trajectory
-    for run_hash in trajectories:
-        S = run_hash['state_sum']  # (N, 6)
+    # --- FIX: iterate over the runs in the stacked array ---
+    S_all = np.asarray(trajectories['state_sum'])  # (R, T, 6)
+    for r in range(S_all.shape[0]):
+        S = S_all[r]  # (T, 6)
         ax.plot(S[:, 0], S[:, 1], S[:, 2], linewidth=1.0)
 
     ax.set_title('Spherical Trajectories around Beacon (0, 0, 1)')
     ax.set_xlabel('X'); ax.set_ylabel('Y'); ax.set_zlabel('Z')
     ax.legend(loc='upper left')
+    _set_axes_equal(ax)  # optional: keeps aspect ratio sane
 
     if save_as_png:
         plt.savefig('rover_trajectories.png', format='png', dpi=dpi)
@@ -243,6 +240,126 @@ def plot_pf_xyz_est_vs_truth(monte_data, run_idx=0, sim_hz=None, imu_hz=None):
 
     return {'t': t, 'est_xyz': est, 'truth_xyz': tru_pf}
 
+def plot_pf_state_errors_all_runs(monte_data, output_dir='sim_results', sim_hz=sim_hz, imu_hz=imu_hz,
+                                  state_labels=None, dpi=150, show=False):
+    """
+    For each state dimension s, plot ALL runs' errors e_r^s(t) on one chart and save as JPG.
+
+    Expects (after PF run):
+      monte_data['state_sum']  : (R, T_sim, S)  true states
+      monte_data['x_estimate'] : (R, T_pf,  S)  estimated states
+
+    Saves:
+      <output_dir>/state_<label_or_index>_errors.jpg
+
+    Also adds to monte_data:
+      monte_data['err'] : (R, T_pf, S)  (est - true) aligned to PF timestamps
+    """
+    # ---- pull arrays ----
+    x_true_all = monte_data['state_sum']      # (R, T_sim, S)
+    x_hat_all  = monte_data['x_estimate']     # (R, T_pf,  S)
+
+    R, T_sim, S = x_true_all.shape
+    R2, T_pf, S2 = x_hat_all.shape
+    if not (R == R2 and S == S2):
+        raise ValueError(f"Shape mismatch: true {x_true_all.shape} vs est {x_hat_all.shape}")
+
+    # ---- time alignment (nearest) ----
+    t_pf  = np.arange(T_pf)  / float(imu_hz)
+    sim_idx = np.clip(np.rint(t_pf * sim_hz).astype(int), 0, T_sim - 1)
+    x_true_at_pf = x_true_all[:, sim_idx, :]  # (R, T_pf, S)
+
+    # ---- errors ----
+    err = x_hat_all - x_true_at_pf           # (R, T_pf, S)
+    monte_data['err'] = err                   # stash for later use
+
+    # ---- labels ----
+    if state_labels is None:
+        state_labels = [f"s{i}" for i in range(S)]
+    elif len(state_labels) != S:
+        raise ValueError(f"state_labels length {len(state_labels)} != S {S}")
+
+    # ---- output dir ----
+    os.makedirs(output_dir, exist_ok=True)
+
+    # ---- one figure per state: plot all runs ----
+    for s in range(S):
+        plt.figure()
+        for r in range(R):
+            plt.plot(t_pf, err[r, :, s], linewidth=1.0)
+        plt.xlabel("Time [s]")
+        plt.ylabel(f"{state_labels[s]} Error")
+        plt.title(f"Per-Run Errors for state: {state_labels[s]}  (Num Runs={R})")
+        plt.grid(True)
+        plt.tight_layout()
+
+        out_path = os.path.join(output_dir, f"state_{state_labels[s]}_errors.jpg")
+        plt.savefig(out_path, dpi=dpi)
+        if show:
+            plt.show()
+        else:
+            plt.close()
+
+    return err, t_pf
+
+def _set_axes_equal(ax):
+    # Make 3D axes have equal scale
+    x_limits = ax.get_xlim3d()
+    y_limits = ax.get_ylim3d()
+    z_limits = ax.get_zlim3d()
+    x_range = x_limits[1] - x_limits[0]
+    y_range = y_limits[1] - y_limits[0]
+    z_range = z_limits[1] - z_limits[0]
+    max_range = max(x_range, y_range, z_range)
+    x_mid = np.mean(x_limits); y_mid = np.mean(y_limits); z_mid = np.mean(z_limits)
+    ax.set_xlim3d(x_mid - max_range/2, x_mid + max_range/2)
+    ax.set_ylim3d(y_mid - max_range/2, y_mid + max_range/2)
+    ax.set_zlim3d(z_mid - max_range/2, z_mid + max_range/2)
+
+def plot_trajectories_monte(monte_data, fig_num=1, save_as_png=False, dpi=300,
+                            outfile="rover_trajectories.png",
+                            CENTER=None, BEACONS=None, title="Trajectories"):
+    """
+    Plots all true trajectories from monte_data['state_sum'] (R, T_sim, 6).
+
+    Args:
+      monte_data: dict with key 'state_sum' of shape (R, T, 6)
+      CENTER: optional (3,) beacon center to mark with an 'X'
+      BEACONS: optional (M,3) array of beacon positions to scatter
+    """
+    S_all = monte_data['state_sum']  # (R, T, 6)
+    R, T, S = S_all.shape
+    assert S >= 3, "Expect at least x,y,z in state"
+
+    fig = plt.figure(fig_num)
+    ax = fig.add_subplot(111, projection='3d')
+
+    # Plot beacons or center marker if provided
+    if BEACONS is not None:
+        BEACONS = np.asarray(BEACONS, float)
+        ax.scatter(BEACONS[:,0], BEACONS[:,1], BEACONS[:,2],
+                   s=40, marker='^', label='Beacons', zorder=5)
+    elif CENTER is not None:
+        ax.scatter([CENTER[0]], [CENTER[1]], [CENTER[2]],
+                   s=80, marker='X', label='Beacon', zorder=5)
+
+    # Plot each run's true trajectory
+    for r in range(R):
+        S_run = S_all[r]              # (T, 6)
+        ax.plot(S_run[:,0], S_run[:,1], S_run[:,2], linewidth=1.0)
+
+    ax.set_title(title)
+    ax.set_xlabel('X'); ax.set_ylabel('Y'); ax.set_zlabel('Z')
+    if (BEACONS is not None) or (CENTER is not None):
+        ax.legend(loc='upper left')
+
+    # Make axes equal so shapes aren’t distorted
+    _set_axes_equal(ax)
+
+    if save_as_png:
+        plt.savefig(outfile, format='png', dpi=dpi, bbox_inches='tight')
+    plt.show()
+
 
 # =========================
 # Main
@@ -253,4 +370,4 @@ if __name__ == "__main__":
     #plot_trajectories(monte_data, fig_num=1, save_as_png=False, dpi=300)
 
     monte_data = particle_filter.run_pf_for_all_runs(monte_data)
-    plot_pf_xyz_est_vs_truth(monte_data)
+    plot_pf_state_errors_all_runs(monte_data)
