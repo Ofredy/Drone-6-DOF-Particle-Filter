@@ -51,8 +51,19 @@ def pf_init():
 
 # takes in particles & accelerametor measurement & gives back the new state of particles
 def prediction_step(x_k, u_k):
-    
-    return A @ x_k + (B @ u_k)[:, None] + B @ np.random.normal(0.0, np.sqrt(process_noise_variance), size=(3, x_k.shape[1]))
+    # deterministic motion update
+    x_pred = A @ x_k + (B @ u_k)[:, None]
+
+    # add process noise directly to [x,y,z,vx,vy,vz]
+    # tune these stds, not all equal!
+    pos_drift_std = 0.05   # meters per step, try 2cm per IMU tick
+    vel_drift_std = 0.00  # m/s per step, try 5cm/s per IMU tick
+
+    noise = np.zeros_like(x_pred)
+    noise[0:3, :] = _rng.normal(0.0, pos_drift_std, size=(3, x_k.shape[1]))
+    noise[3:6, :] = _rng.normal(0.0, vel_drift_std, size=(3, x_k.shape[1]))
+
+    return x_pred + noise
 
 def jitter_particles_diag(X, process_noise_variance, kappa=0.3, rng=_rng):
     """
@@ -304,16 +315,16 @@ def run_pf_for_all_runs(monte_data):
                     z, x_k_all[r, pf_idx], w_k_all[r, pf_idx - 1]
                 )
 
-                #_ = plot_pred_update_step(
-                #                              truth_pos=traj[s, :3],
-                #                              x_pred=x_pred_dbg, w_pred=w_pred_dbg,
-                #                              x_post=x_k_all[r, pf_idx], w_post=w_k_all[r, pf_idx],
-                #                              step_idx=pf_idx
-                #                          )
-
             else:
                 # no update this tick: carry weights forward
                 w_k_all[r, pf_idx] = w_k_all[r, pf_idx - 1]
+
+            #_ = plot_pred_update_step(
+            #                                  truth_pos=traj[s, :3],
+            #                                  x_pred=x_pred_dbg, w_pred=w_pred_dbg,
+            #                                  x_post=x_k_all[r, pf_idx], w_post=w_k_all[r, pf_idx],
+            #                                  step_idx=pf_idx
+            #                              )
 
             #if pf_idx > 20:
             #    import pdb; pdb.set_trace()

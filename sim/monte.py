@@ -16,9 +16,9 @@ import particle_filter
 np.random.seed(69)
 
 # Monte Carlo
-NUM_MONTE_RUNS = 100
+NUM_MONTE_RUNS = 5
 
-sim_time = 150  # seconds
+sim_time = 200  # seconds
 sim_hz = 200   # integrator rate (dt = 1/simulation_hz)
 sim_dt = 1 / sim_hz
 
@@ -123,7 +123,7 @@ def generate_trajectories():
     monte_acc   = []
 
     for _ in range(NUM_MONTE_RUNS):
-        rx, ry, rz = 12.0, 12.0, 6.0
+        rx, ry, rz = 10.0, 10.0, 6.0
         w_th = np.random.uniform(0.05, 0.2)
         w_ph = np.random.uniform(0.05, 0.2)
         th0  = np.random.uniform(-np.pi/4, np.pi/4)
