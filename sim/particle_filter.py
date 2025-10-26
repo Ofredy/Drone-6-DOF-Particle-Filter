@@ -6,7 +6,7 @@ from monte import sim_hz
 from system_model import *
 
 # Particle Filter Constants
-NUM_PARTICLES = 500
+NUM_PARTICLES = 1000
 PERCENT_EFFECTIVE = 0.2
 NUM_EFFECTIVE_THRESHOLD = int( NUM_PARTICLES * PERCENT_EFFECTIVE )
 

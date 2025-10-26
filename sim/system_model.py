@@ -11,15 +11,15 @@ measurement_noise_std = 0.01
 measurement_noise_variance = np.sqrt(measurement_noise_std)
 
 # Rates
-imu_hz = 20         # IMU update/logging rate (can be different from integrator)
+imu_hz = 50         # IMU update/logging rate (can be different from integrator)
 pf_dt = 1 / imu_hz
-ranging_hz = 5
+ranging_hz = 1
 
 # Beacons
 CENTER = np.array([0.0,  0.0,  1.0]) # central of drone movement(0,0,1)
 BEACONS = np.array([
     [0.0,    15.0,  0.0],  
-    [-15.0, -15.0,  5.0],
+    [-15.0, -15.0,  10.0],
     #[15.0,  -15.0,  10.0],
     #[  0.0,  -8.3, 25.0],  # new high anchor
 ], dtype=float)
