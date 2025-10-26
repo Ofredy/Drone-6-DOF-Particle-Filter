@@ -16,9 +16,9 @@ import particle_filter
 np.random.seed(69)
 
 # Monte Carlo
-NUM_MONTE_RUNS = 5
+NUM_MONTE_RUNS = 100
 
-sim_time = 200  # seconds
+sim_time = 50  # seconds
 sim_hz = 200   # integrator rate (dt = 1/simulation_hz)
 sim_dt = 1 / sim_hz
 
@@ -73,28 +73,39 @@ def runge_kutta(get_x_dot, x_0, t_0, t_f, dt, accel_fn):
 # ====================================
 # Ellipsoid Reference Motion (Center)
 # ====================================
-def ellipsoid_pos_vel_acc(t, rx, ry, rz, w_th, w_ph, th0=0.0, ph0=0.0):
+def ellipsoid_pos_vel_acc(t, rx, ry, rz, w_th, w_ph,
+                          th0=0.0, ph0=0.0):
+    """
+    Elliptical x-y motion + independent z that starts at 0 and peaks at 12 m.
+    """
+
+    # -----------------
+    # Horizontal motion (unchanged)
+    # -----------------
     th = th0 + w_th * t
     ph = ph0 + w_ph * t
+
     cth, sth = np.cos(th), np.sin(th)
     cph, sph = np.cos(ph), np.sin(ph)
 
-    # position
     x = rx * cth * cph
     y = ry * cth * sph
 
-    # map raw z into [0, 10] — NO additional zero-at-t0 shift
-    z = (rz * sth + rz) * (10.0 / (2.0 * rz))
-
-    # velocities
     vx = -rx * sth * cph * w_th - rx * cth * sph * w_ph
     vy = -ry * sth * sph * w_th + ry * cth * cph * w_ph
-    vz =  rz * cth * w_th * (10.0 / (2.0 * rz))
 
-    # accelerations
     ax = -rx * cth * cph * (w_th**2 + w_ph**2) + 2 * rx * sth * sph * w_th * w_ph
     ay = -ry * cth * sph * (w_th**2 + w_ph**2) - 2 * ry * sth * cph * w_th * w_ph
-    az = -rz * sth * (w_th**2) * (10.0 / (2.0 * rz))
+
+    # -----------------
+    # Vertical motion (new)
+    # -----------------
+    z_max = 12.0  # meters
+    wz = 0.5      # vertical frequency [rad/s], tweak for faster/slower bounce
+    # z(t) = (z_max / 2) * (1 - cos(wz * t)) -> ranges 0..z_max
+    z  = (z_max / 2.0) * (1.0 - np.cos(wz * t))
+    vz = (z_max / 2.0) * (np.sin(wz * t) * wz)
+    az = (z_max / 2.0) * (np.cos(wz * t) * (wz**2))
 
     pos = np.array([x, y, z])
     vel = np.array([vx, vy, vz])

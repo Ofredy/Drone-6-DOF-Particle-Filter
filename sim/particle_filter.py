@@ -6,7 +6,7 @@ from monte import sim_hz
 from system_model import *
 
 # Particle Filter Constants
-NUM_PARTICLES = 1000
+NUM_PARTICLES = 500
 PERCENT_EFFECTIVE = 0.2
 NUM_EFFECTIVE_THRESHOLD = int( NUM_PARTICLES * PERCENT_EFFECTIVE )
 
@@ -56,7 +56,7 @@ def prediction_step(x_k, u_k):
 
     # add process noise directly to [x,y,z,vx,vy,vz]
     # tune these stds, not all equal!
-    pos_drift_std = 0.05   # meters per step, try 2cm per IMU tick
+    pos_drift_std = 0.05  # meters per step, try 2cm per IMU tick
     vel_drift_std = 0.00  # m/s per step, try 5cm/s per IMU tick
 
     noise = np.zeros_like(x_pred)
@@ -160,6 +160,13 @@ def update_step(sensor_measurement, x_k, w_k):
         x_k = jitter_particles_diag(x_k, process_noise_variance, kappa=REJUVENATION_SCALE)
 
     return x_k, w_k
+
+def weighted_median(values, weights):
+    """Compute the weighted median of a 1D array."""
+    sorter = np.argsort(values)
+    values, weights = values[sorter], weights[sorter]
+    cdf = np.cumsum(weights) / np.sum(weights)
+    return values[np.searchsorted(cdf, 0.5)]
 
 def plot_pred_update_step(truth_pos, x_pred, w_pred, x_post, w_post, step_idx=None):
     """
@@ -330,7 +337,11 @@ def run_pf_for_all_runs(monte_data):
             #    import pdb; pdb.set_trace()
 
             # State estimate as weighted mean
-            x_est_all[r, pf_idx] = x_k_all[r, pf_idx] @ w_k_all[r, pf_idx]
+            # Apply per-state weighted median
+            x_est_all[r, pf_idx] = np.array([
+                weighted_median(x_k_all[r, pf_idx][i, :], w_k_all[r, pf_idx])
+                for i in range(NUM_STATES)
+            ])
             pf_idx += 1
 
     # Stash results back
