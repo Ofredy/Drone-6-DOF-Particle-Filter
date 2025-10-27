@@ -52,18 +52,7 @@ def pf_init():
 # takes in particles & accelerametor measurement & gives back the new state of particles
 def prediction_step(x_k, u_k):
     # deterministic motion update
-    x_pred = A @ x_k + (B @ u_k)[:, None]
-
-    # add process noise directly to [x,y,z,vx,vy,vz]
-    # tune these stds, not all equal!
-    pos_drift_std = 0.05  # meters per step, try 2cm per IMU tick
-    vel_drift_std = 0.00  # m/s per step, try 5cm/s per IMU tick
-
-    noise = np.zeros_like(x_pred)
-    noise[0:3, :] = _rng.normal(0.0, pos_drift_std, size=(3, x_k.shape[1]))
-    noise[3:6, :] = _rng.normal(0.0, vel_drift_std, size=(3, x_k.shape[1]))
-
-    return x_pred + noise
+    return A @ x_k + (B @ u_k)[:, None]
 
 def jitter_particles_diag(X, process_noise_variance, kappa=0.3, rng=_rng):
     """
@@ -292,7 +281,7 @@ def run_pf_for_all_runs(monte_data):
     x_est_all = np.zeros((Runs, T_pf, NUM_STATES))
 
     for r in range(Runs):
-        print("run: %d/%d" % (r, Runs))
+        print("run: %d/%d" % (r+1, Runs))
         traj = S_all[r]     # (T_sim, 6)
         acc  = A_all[r]     # (T_sim, 3)
 
@@ -337,11 +326,9 @@ def run_pf_for_all_runs(monte_data):
             #    import pdb; pdb.set_trace()
 
             # State estimate as weighted mean
-            # Apply per-state weighted median
-            x_est_all[r, pf_idx] = np.array([
-                weighted_median(x_k_all[r, pf_idx][i, :], w_k_all[r, pf_idx])
-                for i in range(NUM_STATES)
-            ])
+            x_est_all[r, pf_idx] = np.average(
+                                                  x_k_all[r, pf_idx], axis=1, weights=w_k_all[r, pf_idx]
+                                              )
             pf_idx += 1
 
     # Stash results back

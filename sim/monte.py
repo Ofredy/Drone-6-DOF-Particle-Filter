@@ -112,7 +112,7 @@ def ellipsoid_pos_vel_acc(t, rx, ry, rz, w_th, w_ph,
     acc = np.array([ax, ay, az])
     return pos, vel, acc
 
-def make_ellipsoid_accel_provider(rx, ry, rz, w_th, w_ph, th0=0.0, ph0=0.0, noise_std=0.0):
+def make_ellipsoid_accel_provider(rx, ry, rz, w_th, w_ph, th0=0.0, ph0=0.0, noise_std=process_noise_std):
     pos0_rel, vel0, _ = ellipsoid_pos_vel_acc(0.0, rx, ry, rz, w_th, w_ph, th0, ph0)
 
     x0 = np.zeros(6)
