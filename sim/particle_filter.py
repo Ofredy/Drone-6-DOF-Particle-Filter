@@ -1,5 +1,5 @@
 import numpy as np
-from scipy.stats import norm
+from scipy.stats import norm, chi2
 import matplotlib.pyplot as plt
 
 from monte import sim_hz
@@ -12,7 +12,12 @@ NUM_EFFECTIVE_THRESHOLD = int( NUM_PARTICLES * PERCENT_EFFECTIVE )
 
 _rng = np.random.default_rng()
 BETA = 0.6
+REJUVENATION_VARIANCE = 1e-4   # variance for resampling jitter (position & velocity spread)
 REJUVENATION_SCALE = 0.25
+
+INCONSISTENCY_PROB = 0.99   # 99% chi-square gate
+EXPANSION_POS_FRAC = 0.2   # 2% of room extent per axis as std for x,y,z
+EXPANSION_VEL_STD  = 0.25   # std for vx, vy, vz during expansion
 
 pos_0_std = 0.25
 vel_0_std = 0.5
@@ -51,30 +56,61 @@ def pf_init():
 
 # takes in particles & accelerametor measurement & gives back the new state of particles
 def prediction_step(x_k, u_k):
-    # deterministic motion update
-    return A @ x_k + (B @ u_k)[:, None]
+    # deterministic motion update + process noise
+    x_pred = A @ x_k + (B @ u_k)[:, None]
 
-def jitter_particles_diag(X, process_noise_variance, kappa=0.3, rng=_rng):
+    # Add random Gaussian noise per particle and state
+    noise = np.random.normal(0, process_noise_std, size=x_pred.shape)
+    x_pred = x_pred + noise
+
+    # Enforce position-only bounds by cloning valid high-weight parents for OOB particles
+    x_pred, w_pred = reinject_oob_from_valid_highweight(
+                            x_pred,
+                            np.ones(x_pred.shape[1]) / x_pred.shape[1],  # uniform weights if none available here
+                            bounds=((X_LIM[0], X_LIM[1]), (Y_LIM[0], Y_LIM[1]), (Z_LIM[0], Z_LIM[1]))
+                        )
+
+    return x_pred, w_pred
+
+def jitter_particles_diag(X, rejuvenation_variance=1e-4, kappa=0.25, rng=_rng):
     """
-    Rejuvenation for diagonal Q:
-      Q = diag(process_noise_variance), where process_noise_variance can be:
-        - scalar (same variance for all states), or
-        - (d,) array for per-state variance.
-    Adds Gaussian noise: N(0, kappa * Q) to each particle.
+    Particle rejuvenation (a.k.a. jittering) to prevent sample impoverishment.
+
+    Adds small Gaussian noise to each particle:
+        X_new = X + N(0, kappa * diag(rejuvenation_variance))
+
+    Args:
+        X : (d, N)
+            Particle matrix (d = state dimension, N = number of particles)
+        rejuvenation_variance : float or (d,)
+            Variance for each state dimension (separate from process noise).
+            Controls how much diversity is reintroduced after resampling.
+        kappa : float
+            Scale factor for the noise intensity (0.1–0.3 is typical).
+        rng : np.random.Generator
+            Random number generator (default _rng).
+
+    Returns:
+        X_new : (d, N)
+            Jittered particle set.
     """
     X = np.asarray(X, dtype=np.float64)
     d, N = X.shape
 
-    # Normalize variance to per-state vector
-    if np.isscalar(process_noise_variance):
-        var_vec = float(process_noise_variance) * np.ones(d, dtype=np.float64)
+    # Ensure variance is per-dimension
+    if np.isscalar(rejuvenation_variance):
+        var_vec = float(rejuvenation_variance) * np.ones(d, dtype=np.float64)
     else:
-        var_vec = np.asarray(process_noise_variance, dtype=np.float64)
+        var_vec = np.asarray(rejuvenation_variance, dtype=np.float64)
         if var_vec.shape != (d,):
-            raise ValueError(f"process_noise_variance must be scalar or shape ({d},), got {var_vec.shape}")
+            raise ValueError(f"rejuvenation_variance must be scalar or shape ({d},), got {var_vec.shape}")
 
-    std_vec = np.sqrt(np.maximum(0.0, kappa) * np.maximum(var_vec, 0.0))  # ensure non-neg
-    noise = rng.standard_normal(size=(d, N)) * std_vec[:, None]           # broadcast per-state std
+    # Compute per-state stddev with scaling
+    std_vec = np.sqrt(np.maximum(0.0, kappa) * np.maximum(var_vec, 0.0))
+
+    # Sample Gaussian noise for each particle
+    noise = rng.standard_normal(size=(d, N)) * std_vec[:, None]
+
     return X + noise
 
 def residual_resample(weights, rng=_rng):
@@ -116,12 +152,14 @@ def update_step(sensor_measurement, x_k, w_k):
     sensor_measurement : (M,)  vector of ranges (one per beacon)
     x_k                : (6, N) particles after prediction
     w_k                : (N,)   prior weights
-    Uses globals: BEACONS, measurement_noise_variance, NUM_PARTICLES, NUM_EFFECTIVE_THRESHOLD
+    Uses globals: BEACONS, measurement_noise_variance, NUM_PARTICLES, NUM_EFFECTIVE_THRESHOLD,
+                  INCONSISTENCY_PROB, REJUVENATION_SCALE, REJUVENATION_VARIANCE,
+                  EXPANSION_POS_FRAC, EXPANSION_VEL_STD, X_LIM, Y_LIM, Z_LIM
     """
     # positions and predicted ranges to each beacon
     positions = x_k[0:3, :]                              # (3, N)
     diff = positions.T[None, :, :] - BEACONS[:, None, :] # (M, N, 3)
-    d_hat = np.linalg.norm(diff, axis=2)                 # (M, N)  <-- axis=2 is the xyz norm
+    d_hat = np.linalg.norm(diff, axis=2)                 # (M, N)
 
     # measurement noise: scalar or per-beacon
     sigma = np.sqrt(np.asarray(measurement_noise_variance, float))
@@ -139,16 +177,143 @@ def update_step(sensor_measurement, x_k, w_k):
     else:
         w_k /= s
 
-    # resample if needed (systematic)
+    # --- Inconsistency check (chi-square gate on weighted-mean estimate) ---
+    # Weighted-mean state
+    mu = x_k @ w_k                      # (6,)
+    mu_pos = mu[0:3]                    # (3,)
+    z_hat_mu = np.linalg.norm(BEACONS - mu_pos[None, :], axis=1)  # (M,)
+
+    # Residual and chi-square statistic
+    sigma_vec = np.sqrt(np.asarray(measurement_noise_variance, float))
+    sigma_vec = np.broadcast_to(sigma_vec, sensor_measurement.shape)
+    resid = sensor_measurement - z_hat_mu                 # (M,)
+    chi2_stat = np.sum((resid / sigma_vec) ** 2)
+    chi2_thr  = chi2.ppf(INCONSISTENCY_PROB, df=sensor_measurement.size)
+
+    if chi2_stat > chi2_thr:
+        # >>> Expand around current mean and reset weights (no weight-based resampling) <<<
+        N = x_k.shape[1]
+        room_extent = np.array([X_LIM[1]-X_LIM[0], Y_LIM[1]-Y_LIM[0], Z_LIM[1]-Z_LIM[0]], dtype=np.float64)
+        pos_std = EXPANSION_POS_FRAC * room_extent                   # (3,)
+
+        # Draw new particles around mean
+        pos_noise = _rng.standard_normal(size=(3, N)) * pos_std[:, None]
+        vel_noise = _rng.standard_normal(size=(3, N)) * EXPANSION_VEL_STD
+
+        x_k = np.vstack([
+            (mu_pos[:, None] + pos_noise),
+            (mu[3:6, None] + vel_noise)
+        ])
+
+        # Clip positions back into bounds
+        x_k[0, :] = np.clip(x_k[0, :], X_LIM[0], X_LIM[1])
+        x_k[1, :] = np.clip(x_k[1, :], Y_LIM[0], Y_LIM[1])
+        x_k[2, :] = np.clip(x_k[2, :], Z_LIM[0], Z_LIM[1])
+
+        # Reset weights to uniform
+        w_k = np.full(N, 1.0 / N, dtype=np.float64)
+
+    # Regular degeneracy-based resampling
     eff_particles = 1.0 / np.sum(w_k**2)
     if eff_particles <= NUM_EFFECTIVE_THRESHOLD:
-        # --- residual resampling ---
+        # residual resampling + mild jitter (diversity)
         idx = residual_resample(w_k)
         x_k = x_k[:, idx]
         w_k = np.full(NUM_PARTICLES, 1.0 / NUM_PARTICLES, dtype=np.float64)
-        x_k = jitter_particles_diag(x_k, process_noise_variance, kappa=REJUVENATION_SCALE)
+        x_k = jitter_particles_diag(x_k, REJUVENATION_VARIANCE, kappa=REJUVENATION_SCALE)
+
+    # Ensure positions remain valid
+    x_k, w_k = reinject_oob_from_valid_highweight(
+        x_k, w_k,
+        bounds=((X_LIM[0], X_LIM[1]),
+                (Y_LIM[0], Y_LIM[1]),
+                (Z_LIM[0], Z_LIM[1]))
+    )
 
     return x_k, w_k
+
+def reinject_oob_from_valid_highweight(X, w_ref, bounds, rng=_rng, pos_jitter_std=None):
+    """
+    Enforce position-only bounds by replacing OOB particles with copies
+    drawn from valid, high-weight particles (optionally with tiny pos jitter).
+
+    Args:
+        X : (d, N) particle states [x,y,z,vx,vy,vz]^T
+        w_ref : (N,) reference weights to bias selection (use pre-update weights)
+        bounds : ((x_lo,x_hi), (y_lo,y_hi), (z_lo,z_hi))
+        pos_jitter_std : float or (3,), std dev for position-only jitter (optional)
+
+    Returns:
+        X_new : (d, N)
+        w_new : (N,)
+    """
+    X = np.asarray(X, dtype=np.float64).copy()
+    w_ref = np.asarray(w_ref, dtype=np.float64).copy()
+    d, N = X.shape
+    (x_lo, x_hi), (y_lo, y_hi), (z_lo, z_hi) = bounds
+
+    pos = X[0:3, :]  # (3, N)
+    valid = (
+        (pos[0] >= x_lo) & (pos[0] <= x_hi) &
+        (pos[1] >= y_lo) & (pos[1] <= y_hi) &
+        (pos[2] >= z_lo) & (pos[2] <= z_hi)
+    )
+    invalid_idx = np.where(~valid)[0]
+    if invalid_idx.size == 0:
+        # nothing to fix
+        w_sum = np.sum(w_ref)
+        if w_sum <= 0 or not np.isfinite(w_sum):
+            w_ref[:] = 1.0 / N
+        else:
+            w_ref /= w_sum
+        return X, w_ref
+
+    valid_idx = np.where(valid)[0]
+    if valid_idx.size == 0:
+        # fallback: re-spawn positions uniformly within bounds, keep velocities as-is
+        X[0, invalid_idx] = rng.uniform(x_lo, x_hi, size=invalid_idx.size)
+        X[1, invalid_idx] = rng.uniform(y_lo, y_hi, size=invalid_idx.size)
+        X[2, invalid_idx] = rng.uniform(z_lo, z_hi, size=invalid_idx.size)
+        w_ref[:] = 1.0 / N
+        return X, w_ref
+
+    # sample parent particles among valid ones with prob ~ w_ref
+    w = np.asarray(w_ref, dtype=np.float64)
+    p = w[valid_idx].clip(min=0)
+    s = p.sum()
+    if not np.isfinite(s) or s <= 0:
+        p = np.full(valid_idx.size, 1.0 / valid_idx.size)
+    else:
+        p = p / s
+
+    parents = rng.choice(valid_idx, size=invalid_idx.size, replace=True, p=p)
+    X[:, invalid_idx] = X[:, parents]                 # copy state
+    w_ref[invalid_idx] = w_ref[parents]               # copy weights
+
+    # tiny optional position jitter to avoid exact duplicates
+    if pos_jitter_std is None:
+        xr, yr, zr = (x_hi - x_lo), (y_hi - y_lo), (z_hi - z_lo)
+        pos_jitter_std = np.array([xr, yr, zr]) * 1e-3  # ~0.1% of room size
+    pos_jitter_std = np.atleast_1d(pos_jitter_std).astype(float)
+    if pos_jitter_std.size == 1:
+        pos_jitter_std = np.repeat(pos_jitter_std[0], 3)
+
+    jitter = rng.standard_normal(size=(3, invalid_idx.size)) * pos_jitter_std[:, None]
+    X[0:3, invalid_idx] += jitter
+
+    # ensure we’re back inside bounds after jitter
+    X[0, :] = np.clip(X[0, :], x_lo, x_hi)
+    X[1, :] = np.clip(X[1, :], y_lo, y_hi)
+    X[2, :] = np.clip(X[2, :], z_lo, z_hi)
+
+    # ✅ re-normalize weights
+    w_sum = np.sum(w_ref)
+    if w_sum <= 0 or not np.isfinite(w_sum):
+        w_ref[:] = 1.0 / N
+    else:
+        w_ref /= w_sum
+
+    return X, w_ref
 
 def weighted_median(values, weights):
     """Compute the weighted median of a 1D array."""
@@ -271,9 +436,14 @@ def run_pf_for_all_runs(monte_data):
         raise ValueError("imu_hz must be <= sim_hz and yield an integer ratio for this path.")
     T_pf = 1 + (T_sim - 1) // step_div_imu   # include t=0
 
-    step_div_rng = int(sim_hz // ranging_hz)
-    if step_div_rng < 1 or not np.isclose(sim_hz, step_div_rng * ranging_hz):
-        raise ValueError("ranging_hz must be <= sim_hz and divide it evenly.")
+    # Allow ranging_hz < 1 (e.g. 0.5 Hz = every 2 seconds)
+    if ranging_hz <= 0:
+        raise ValueError("ranging_hz must be positive.")
+
+    step_div_rng = int(round(sim_hz / ranging_hz))  # works for <1Hz too
+
+    if not np.isclose(sim_hz / ranging_hz, step_div_rng, atol=1e-6):
+        raise ValueError("ranging_hz must divide sim_hz evenly (can be fractional, e.g. 0.5Hz).")
 
     # Allocate
     x_k_all = np.zeros((Runs, T_pf, NUM_STATES, NUM_PARTICLES))
@@ -296,7 +466,7 @@ def run_pf_for_all_runs(monte_data):
                 continue
 
             # Prediction with current acceleration sample
-            x_k_all[r, pf_idx] = prediction_step(x_k_all[r, pf_idx - 1], acc[s])
+            x_k_all[r, pf_idx], w_k_all[r, pf_idx - 1] = prediction_step(x_k_all[r, pf_idx - 1], acc[s])
             x_pred_dbg = x_k_all[r, pf_idx].copy()
             w_pred_dbg = w_k_all[r, pf_idx - 1].copy()
 
@@ -311,19 +481,16 @@ def run_pf_for_all_runs(monte_data):
                     z, x_k_all[r, pf_idx], w_k_all[r, pf_idx - 1]
                 )
 
+                #_ = plot_pred_update_step(
+                #                                  truth_pos=traj[s, :3],
+                #                                  x_pred=x_pred_dbg, w_pred=w_pred_dbg,
+                #                                  x_post=x_k_all[r, pf_idx], w_post=w_k_all[r, pf_idx],
+                #                                  step_idx=pf_idx
+                #                              )
+
             else:
                 # no update this tick: carry weights forward
                 w_k_all[r, pf_idx] = w_k_all[r, pf_idx - 1]
-
-            #_ = plot_pred_update_step(
-            #                                  truth_pos=traj[s, :3],
-            #                                  x_pred=x_pred_dbg, w_pred=w_pred_dbg,
-            #                                  x_post=x_k_all[r, pf_idx], w_post=w_k_all[r, pf_idx],
-            #                                  step_idx=pf_idx
-            #                              )
-
-            #if pf_idx > 20:
-            #    import pdb; pdb.set_trace()
 
             # State estimate as weighted mean
             x_est_all[r, pf_idx] = np.average(
