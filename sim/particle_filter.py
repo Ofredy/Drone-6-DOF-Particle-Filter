@@ -6,18 +6,18 @@ from monte import sim_hz
 from system_model import *
 
 # Particle Filter Constants
-NUM_PARTICLES = 500
-PERCENT_EFFECTIVE = 0.2
+NUM_PARTICLES = 1000
+PERCENT_EFFECTIVE = 0.3
 NUM_EFFECTIVE_THRESHOLD = int( NUM_PARTICLES * PERCENT_EFFECTIVE )
 
 _rng = np.random.default_rng()
-BETA = 0.6
-REJUVENATION_VARIANCE = 1e-4   # variance for resampling jitter (position & velocity spread)
-REJUVENATION_SCALE = 0.25
+BETA = 0.5
+REJUVENATION_VARIANCE = 5e-3   # variance for resampling jitter (position & velocity spread)
+REJUVENATION_SCALE = 0.15
 
-INCONSISTENCY_PROB = 0.99   # 99% chi-square gate
-EXPANSION_POS_FRAC = 0.2   # 2% of room extent per axis as std for x,y,z
-EXPANSION_VEL_STD  = 0.25   # std for vx, vy, vz during expansion
+INCONSISTENCY_PROB = 0.995   # 99% chi-square gate
+EXPANSION_POS_FRAC = 0.05   # 2% of room extent per axis as std for x,y,z
+EXPANSION_VEL_STD  = 0.15   # std for vx, vy, vz during expansion
 
 pos_0_std = 0.25
 vel_0_std = 0.5
@@ -56,19 +56,60 @@ def pf_init():
 
 # takes in particles & accelerametor measurement & gives back the new state of particles
 def prediction_step(x_k, u_k):
-    # deterministic motion update + process noise
+    """
+    x_k : (6, N) particle states [x, y, z, vx, vy, vz]
+    u_k : (3,)   control acceleration input (e.g., commanded accel)
+
+    Uses globals:
+        A, B,
+        pf_dt,              # time step of the PF dynamics [s]
+        process_noise_std,  # interpreted as accel noise std [m/s^2]
+        X_LIM, Y_LIM, Z_LIM,
+        reinject_oob_from_valid_highweight
+    """
+    # -----------------------------
+    # Deterministic motion update
+    # -----------------------------
     x_pred = A @ x_k + (B @ u_k)[:, None]
 
-    # Add random Gaussian noise per particle and state
-    noise = np.random.normal(0, process_noise_std, size=x_pred.shape)
+    # -----------------------------
+    # Process noise: random accel model
+    # -----------------------------
+    # Interpret process_noise_std as σ_a (accel noise std)
+    sigma_a = float(process_noise_std)   # [m/s^2]
+
+    # For each axis, with state [x, y, z, vx, vy, vz]:
+    # diag(Qd) ≈ [ (dt^4/4)*σ_a^2, (dt^4/4)*σ_a^2, (dt^4/4)*σ_a^2,
+    #              (dt^2)*σ_a^2,   (dt^2)*σ_a^2,   (dt^2)*σ_a^2 ]
+    dt = pf_dt
+    pos_std = 0.5 * (dt**2) * sigma_a      # sqrt(dt^4/4 * σ_a^2)
+    vel_std = dt * sigma_a                 # sqrt(dt^2 * σ_a^2)
+
+    # Build per-state std vector (6,)
+    diag_std = np.array([
+        pos_std, pos_std, pos_std,
+        vel_std, vel_std, vel_std
+    ], dtype=float)
+
+    # Draw Gaussian noise per state dimension and particle
+    noise = np.random.normal(
+        loc=0.0,
+        scale=diag_std[:, None],   # broadcast over particles
+        size=x_pred.shape
+    )
     x_pred = x_pred + noise
 
-    # Enforce position-only bounds by cloning valid high-weight parents for OOB particles
+    # --------------------------------------------------------
+    # Enforce bounds: clone valid high-weight parents for OOB
+    # (here we don't have weights yet, so use uniform weights)
+    # --------------------------------------------------------
     x_pred, w_pred = reinject_oob_from_valid_highweight(
-                            x_pred,
-                            np.ones(x_pred.shape[1]) / x_pred.shape[1],  # uniform weights if none available here
-                            bounds=((X_LIM[0], X_LIM[1]), (Y_LIM[0], Y_LIM[1]), (Z_LIM[0], Z_LIM[1]))
-                        )
+        x_pred,
+        np.ones(x_pred.shape[1], dtype=float) / x_pred.shape[1],
+        bounds=((X_LIM[0], X_LIM[1]),
+                (Y_LIM[0], Y_LIM[1]),
+                (Z_LIM[0], Z_LIM[1]))
+    )
 
     return x_pred, w_pred
 
@@ -152,10 +193,18 @@ def update_step(sensor_measurement, x_k, w_k):
     sensor_measurement : (M,)  vector of ranges (one per beacon)
     x_k                : (6, N) particles after prediction
     w_k                : (N,)   prior weights
-    Uses globals: BEACONS, measurement_noise_variance, NUM_PARTICLES, NUM_EFFECTIVE_THRESHOLD,
-                  INCONSISTENCY_PROB, REJUVENATION_SCALE, REJUVENATION_VARIANCE,
-                  EXPANSION_POS_FRAC, EXPANSION_VEL_STD, X_LIM, Y_LIM, Z_LIM
+
+    Uses globals:
+      BEACONS, measurement_noise_variance,
+      NUM_PARTICLES, NUM_EFFECTIVE_THRESHOLD,
+      INCONSISTENCY_PROB,
+      REJUVENATION_SCALE, REJUVENATION_VARIANCE,
+      EXPANSION_POS_FRAC, EXPANSION_VEL_STD,
+      X_LIM, Y_LIM, Z_LIM
     """
+    # -------------------------
+    # Likelihood / weight update
+    # -------------------------
     # positions and predicted ranges to each beacon
     positions = x_k[0:3, :]                              # (3, N)
     diff = positions.T[None, :, :] - BEACONS[:, None, :] # (M, N, 3)
@@ -163,8 +212,10 @@ def update_step(sensor_measurement, x_k, w_k):
 
     # measurement noise: scalar or per-beacon
     sigma = np.sqrt(np.asarray(measurement_noise_variance, float))
+    sigma = np.broadcast_to(sigma, sensor_measurement.shape)  # (M,)
+
     # per-beacon likelihoods -> (M, N)
-    lk_per = norm.pdf(sensor_measurement[:, None], loc=d_hat, scale=sigma)
+    lk_per = norm.pdf(sensor_measurement[:, None], loc=d_hat, scale=sigma[:, None])
 
     # combine beacons: product across M -> (N,)
     lk = np.prod(np.maximum(lk_per, 1e-300), axis=0)
@@ -177,32 +228,43 @@ def update_step(sensor_measurement, x_k, w_k):
     else:
         w_k /= s
 
-    # --- Inconsistency check (chi-square gate on weighted-mean estimate) ---
+    # -------------------------------------------
+    # Inconsistency check (chi-square on mean est)
+    # -------------------------------------------
     # Weighted-mean state
-    mu = x_k @ w_k                      # (6,)
-    mu_pos = mu[0:3]                    # (3,)
+    mu = estimate_state_from_particles(x_k, w_k)  # (6,)
+    mu_pos = mu[0:3]                              # (3,)
+
+    # Predicted ranges from mean position
     z_hat_mu = np.linalg.norm(BEACONS - mu_pos[None, :], axis=1)  # (M,)
 
     # Residual and chi-square statistic
-    sigma_vec = np.sqrt(np.asarray(measurement_noise_variance, float))
-    sigma_vec = np.broadcast_to(sigma_vec, sensor_measurement.shape)
-    resid = sensor_measurement - z_hat_mu                 # (M,)
-    chi2_stat = np.sum((resid / sigma_vec) ** 2)
+    resid = sensor_measurement - z_hat_mu          # (M,)
+    chi2_stat = np.sum((resid / sigma) ** 2)
     chi2_thr  = chi2.ppf(INCONSISTENCY_PROB, df=sensor_measurement.size)
 
     if chi2_stat > chi2_thr:
-        # >>> Expand around current mean and reset weights (no weight-based resampling) <<<
+        # ======================================================
+        # BIG mismatch: expand around *current mean* and reset
+        # ======================================================
         N = x_k.shape[1]
-        room_extent = np.array([X_LIM[1]-X_LIM[0], Y_LIM[1]-Y_LIM[0], Z_LIM[1]-Z_LIM[0]], dtype=np.float64)
-        pos_std = EXPANSION_POS_FRAC * room_extent                   # (3,)
 
-        # Draw new particles around mean
+        # Use room size only to set the scale of expansion
+        room_extent = np.array(
+            [X_LIM[1] - X_LIM[0],
+             Y_LIM[1] - Y_LIM[0],
+             Z_LIM[1] - Z_LIM[0]],
+            dtype=np.float64
+        )
+        pos_std = EXPANSION_POS_FRAC * room_extent   # (3,)
+
+        # Draw new particles around current mean state
         pos_noise = _rng.standard_normal(size=(3, N)) * pos_std[:, None]
         vel_noise = _rng.standard_normal(size=(3, N)) * EXPANSION_VEL_STD
 
         x_k = np.vstack([
-            (mu_pos[:, None] + pos_noise),
-            (mu[3:6, None] + vel_noise)
+            mu_pos[:, None]    + pos_noise,      # positions
+            mu[3:6, None]      + vel_noise      # velocities
         ])
 
         # Clip positions back into bounds
@@ -213,16 +275,31 @@ def update_step(sensor_measurement, x_k, w_k):
         # Reset weights to uniform
         w_k = np.full(N, 1.0 / N, dtype=np.float64)
 
-    # Regular degeneracy-based resampling
+        # After a full "re-expand", neff is high (uniform), so
+        # the degeneracy test below won't immediately resample.
+
+    # ---------------------------------
+    # Regular degeneracy-based resample
+    # ---------------------------------
     eff_particles = 1.0 / np.sum(w_k**2)
     if eff_particles <= NUM_EFFECTIVE_THRESHOLD:
-        # residual resampling + mild jitter (diversity)
+        # residual resampling
         idx = residual_resample(w_k)
         x_k = x_k[:, idx]
-        w_k = np.full(NUM_PARTICLES, 1.0 / NUM_PARTICLES, dtype=np.float64)
-        x_k = jitter_particles_diag(x_k, REJUVENATION_VARIANCE, kappa=REJUVENATION_SCALE)
 
+        # reset weights
+        w_k = np.full(NUM_PARTICLES, 1.0 / NUM_PARTICLES, dtype=np.float64)
+
+        # mild jitter for diversity (uses your new constants)
+        x_k = jitter_particles_diag(
+            x_k,
+            REJUVENATION_VARIANCE,
+            kappa=REJUVENATION_SCALE
+        )
+
+    # ------------------------------
     # Ensure positions remain valid
+    # ------------------------------
     x_k, w_k = reinject_oob_from_valid_highweight(
         x_k, w_k,
         bounds=((X_LIM[0], X_LIM[1]),
@@ -360,10 +437,14 @@ def plot_pred_update_step(truth_pos, x_pred, w_pred, x_post, w_post, step_idx=No
 
     pos_pred = x_pred[0:3, :]   # (3, N)
     pos_post = x_post[0:3, :]   # (3, N)
-
-    mu_pred = pos_pred @ w_pred    # (3,)
-    mu_post = pos_post @ w_post    # (3,)
-
+    
+    # use the same estimator (mean vs median based on # beacons)
+    mu_pred_full = estimate_state_from_particles(x_pred, w_pred)  # (6,)
+    mu_post_full = estimate_state_from_particles(x_post, w_post)  # (6,)
+    
+    mu_pred = mu_pred_full[0:3]
+    mu_post = mu_post_full[0:3]
+    
     e_pred = np.linalg.norm(mu_pred - truth_pos)
     e_post = np.linalg.norm(mu_post - truth_pos)
 
@@ -412,6 +493,43 @@ def plot_pred_update_step(truth_pos, x_pred, w_pred, x_post, w_post, step_idx=No
         'err_post':    e_post,
     }
 
+def estimate_state_from_particles(x_k, w_k):
+    """
+    Adaptive state estimate:
+      - If only 1 beacon: use weighted median per state dimension.
+      - If >=2 beacons:   use weighted mean per state dimension.
+    """
+    x_k = np.asarray(x_k, dtype=float)
+    w   = np.asarray(w_k, dtype=float)
+
+    # Normalize weights safely
+    s = w.sum()
+    if not np.isfinite(s) or s <= 0.0:
+        w = np.full_like(w, 1.0 / w.size)
+    else:
+        w = w / s
+
+    # How many beacons?
+    B = np.asarray(BEACONS)
+    if B.ndim == 1:
+        # e.g. BEACONS is (3,) -> treat as 1 beacon
+        M = 1
+    else:
+        M = B.shape[0]
+
+    d, N = x_k.shape
+    est = np.empty(d, dtype=float)
+
+    if M <= 1:
+        # ----- 1 beacon: use weighted median per dimension -----
+        for i in range(d):
+            est[i] = weighted_median(x_k[i, :], w)
+    else:
+        # ----- >=2 beacons: standard weighted mean -----
+        est = x_k @ w
+
+    return est
+
 def run_pf_for_all_runs(monte_data):
     """
     Expects:
@@ -457,7 +575,9 @@ def run_pf_for_all_runs(monte_data):
 
         # init (t = 0)
         x_k_all[r, 0], w_k_all[r, 0] = pf_init()
-        x_est_all[r, 0] = x_k_all[r, 0] @ w_k_all[r, 0]
+        x_est_all[r, 0] = estimate_state_from_particles(
+                                x_k_all[r, 0], w_k_all[r, 0]
+                            )
 
         pf_idx = 1
         for s in range(1, T_sim):
@@ -493,9 +613,9 @@ def run_pf_for_all_runs(monte_data):
                 w_k_all[r, pf_idx] = w_k_all[r, pf_idx - 1]
 
             # State estimate as weighted mean
-            x_est_all[r, pf_idx] = np.average(
-                                                  x_k_all[r, pf_idx], axis=1, weights=w_k_all[r, pf_idx]
-                                              )
+            x_est_all[r, pf_idx] = estimate_state_from_particles(
+                                            x_k_all[r, pf_idx], w_k_all[r, pf_idx]
+                                        )
             pf_idx += 1
 
     # Stash results back
