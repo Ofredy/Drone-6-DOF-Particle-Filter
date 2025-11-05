@@ -7,13 +7,13 @@ from system_model import *
 
 # Particle Filter Constants
 NUM_PARTICLES = 1000
-PERCENT_EFFECTIVE = 0.3
+PERCENT_EFFECTIVE = 0.2
 NUM_EFFECTIVE_THRESHOLD = int( NUM_PARTICLES * PERCENT_EFFECTIVE )
 
 _rng = np.random.default_rng()
-BETA = 0.5
-REJUVENATION_VARIANCE = 5e-3   # variance for resampling jitter (position & velocity spread)
-REJUVENATION_SCALE = 0.15
+BETA = 0.2
+REJUVENATION_VARIANCE = 1e-3   # variance for resampling jitter (position & velocity spread)
+REJUVENATION_SCALE = 0.05
 
 INCONSISTENCY_PROB = 0.995   # 99% chi-square gate
 EXPANSION_POS_FRAC = 0.05   # 2% of room extent per axis as std for x,y,z
@@ -336,13 +336,9 @@ def reinject_oob_from_valid_highweight(X, w_ref, bounds, rng=_rng, pos_jitter_st
         (pos[2] >= z_lo) & (pos[2] <= z_hi)
     )
     invalid_idx = np.where(~valid)[0]
+
+    # 🔑 If nothing is out-of-bounds, don't touch weights or states
     if invalid_idx.size == 0:
-        # nothing to fix
-        w_sum = np.sum(w_ref)
-        if w_sum <= 0 or not np.isfinite(w_sum):
-            w_ref[:] = 1.0 / N
-        else:
-            w_ref /= w_sum
         return X, w_ref
 
     valid_idx = np.where(valid)[0]
@@ -383,7 +379,7 @@ def reinject_oob_from_valid_highweight(X, w_ref, bounds, rng=_rng, pos_jitter_st
     X[1, :] = np.clip(X[1, :], y_lo, y_hi)
     X[2, :] = np.clip(X[2, :], z_lo, z_hi)
 
-    # ✅ re-normalize weights
+    # ✅ re-normalize weights only when we actually changed some of them
     w_sum = np.sum(w_ref)
     if w_sum <= 0 or not np.isfinite(w_sum):
         w_ref[:] = 1.0 / N
@@ -437,14 +433,14 @@ def plot_pred_update_step(truth_pos, x_pred, w_pred, x_post, w_post, step_idx=No
 
     pos_pred = x_pred[0:3, :]   # (3, N)
     pos_post = x_post[0:3, :]   # (3, N)
-    
+
     # use the same estimator (mean vs median based on # beacons)
     mu_pred_full = estimate_state_from_particles(x_pred, w_pred)  # (6,)
     mu_post_full = estimate_state_from_particles(x_post, w_post)  # (6,)
-    
+
     mu_pred = mu_pred_full[0:3]
     mu_post = mu_post_full[0:3]
-    
+
     e_pred = np.linalg.norm(mu_pred - truth_pos)
     e_post = np.linalg.norm(mu_post - truth_pos)
 
@@ -598,8 +594,7 @@ def run_pf_for_all_runs(monte_data):
             # Measurement update (your update_step returns (x_k_new, w_k_new))
             if ( s % step_div_rng ) == 0:
                 x_k_all[r, pf_idx], w_k_all[r, pf_idx] = update_step(
-                    z, x_k_all[r, pf_idx], w_k_all[r, pf_idx - 1]
-                )
+                    z, x_k_all[r, pf_idx], w_k_all[r, pf_idx - 1])
 
                 #_ = plot_pred_update_step(
                 #                                  truth_pos=traj[s, :3],

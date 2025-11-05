@@ -371,6 +371,140 @@ def plot_trajectories_monte(monte_data, fig_num=1, save_as_png=False, dpi=300,
         plt.savefig(outfile, format='png', dpi=dpi, bbox_inches='tight')
     plt.show()
 
+def plot_pf_weight_pdfs_vs_time(
+    monte_data,
+    run_idx=0,
+    output_dir='sim_results',
+    dpi=200,
+    sim_hz=sim_hz,
+    imu_hz=imu_hz,
+    show=False,
+):
+    """
+    For a single run, plot where the particles actually are over time, with
+    brightness (grayscale intensity) proportional to particle weight.
+
+    Produces and saves:
+        sim_results/state_x_pdf_run<idx>.jpg
+        sim_results/state_y_pdf_run<idx>.jpg
+
+    Each figure:
+      - x-axis: time [s]
+      - y-axis: state value (x or y)
+      - points: particles (t, state_value) with brightness ~ weight
+      - white dashed: truth
+      - red: PF estimate
+    """
+    import os
+    os.makedirs(output_dir, exist_ok=True)
+
+    x_k_all = np.asarray(monte_data['x_k'])        # (R, T_pf, NUM_STATES, N)
+    w_k_all = np.asarray(monte_data['w_k'])        # (R, T_pf, N)
+    x_est_all = np.asarray(monte_data['x_estimate'])  # (R, T_pf, NUM_STATES)
+    S_all = np.asarray(monte_data['state_sum'])    # (R, T_sim, 6)
+
+    # Ensure run dimension
+    if x_k_all.ndim == 3:
+        x_k_all = x_k_all[None, ...]
+        w_k_all = w_k_all[None, ...]
+        x_est_all = x_est_all[None, ...]
+        S_all = S_all[None, ...]
+
+    Xk = x_k_all[run_idx]        # (T_pf, S, N)
+    Wk = w_k_all[run_idx]        # (T_pf, N)
+    Xest = x_est_all[run_idx]    # (T_pf, S)
+    Xtrue = S_all[run_idx]       # (T_sim, 6)
+
+    T_pf, S_dim, N = Xk.shape
+    T_sim = Xtrue.shape[0]
+
+    # PF time axis
+    t_pf = np.arange(T_pf, dtype=float) / float(imu_hz)
+
+    # Align truth to PF timestamps
+    sim_idx = np.clip(np.rint(t_pf * sim_hz).astype(int), 0, T_sim - 1)
+    Xtrue_at_pf = Xtrue[sim_idx, :]   # (T_pf, 6)
+
+    # x = state 0, y = state 1
+    state_indices = [0, 1]
+    labels = ['x', 'y']
+    limits = [(X_LIM[0], X_LIM[1]), (Y_LIM[0], Y_LIM[1])]
+
+    for s_idx, label, (vmin, vmax) in zip(state_indices, labels, limits):
+        # Particles for this state over time: (T_pf, N)
+        vals = Xk[:, s_idx, :]
+        weights = Wk.copy()
+
+        # Normalize weights per time step
+        for t_idx in range(T_pf):
+            w_t = weights[t_idx, :]
+            s = w_t.sum()
+            if (not np.isfinite(s)) or (s <= 0.0):
+                weights[t_idx, :] = 1.0 / N
+            else:
+                weights[t_idx, :] = w_t / s
+
+        # Flatten for scatter: (T_pf * N,)
+        t_grid = np.repeat(t_pf, N)
+        v_flat = vals.reshape(-1)
+        w_flat = weights.reshape(-1)
+
+        # Normalize weights globally for color [0,1]
+        w_max = np.max(w_flat)
+        if (not np.isfinite(w_max)) or (w_max <= 0.0):
+            w_norm = np.zeros_like(w_flat)
+        else:
+            w_norm = w_flat / w_max
+
+        plt.figure(figsize=(9, 5))
+
+        # Scatter with brightness (grayscale) = weight
+        sc = plt.scatter(
+            t_grid,
+            v_flat,
+            s=15.0,                # fixed size
+            c=w_norm,              # color encodes weight
+            cmap='Greys',          # darker=low, brighter=high
+            vmin=0.0,
+            vmax=1.0,
+            alpha=0.9,
+        )
+
+        # Overlay truth and estimate
+        plt.plot(
+            t_pf,
+            Xtrue_at_pf[:, s_idx],
+            linestyle='--',
+            color='cyan',
+            linewidth=1.2,
+            label=f'{label} truth'
+        )
+        plt.plot(
+            t_pf,
+            Xest[:, s_idx],
+            color='red',
+            linewidth=1.0,
+            label=f'{label} estimate'
+        )
+
+        plt.ylim(vmin, vmax)
+        plt.xlabel('Time [s]')
+        plt.ylabel(f'{label}(t)')
+        plt.title(f'Particle weights vs time ({label}, run {run_idx})')
+        plt.legend(loc='upper right')
+
+        cbar = plt.colorbar(sc)
+        cbar.set_label('normalized particle weight')
+
+        plt.tight_layout()
+
+        out_path = os.path.join(output_dir, f'state_{label}_pdf_run{run_idx}.jpg')
+        plt.savefig(out_path, dpi=dpi)
+        if show:
+            plt.show()
+        else:
+            plt.close()
+
 
 # =========================
 # Main
@@ -382,3 +516,4 @@ if __name__ == "__main__":
 
     monte_data = particle_filter.run_pf_for_all_runs(monte_data)
     plot_pf_state_errors_all_runs(monte_data)
+    #plot_pf_weight_pdfs_vs_time(monte_data, run_idx=0)

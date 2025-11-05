@@ -20,7 +20,7 @@ CENTER = np.array([0.0,  0.0,  1.0]) # central of drone movement(0,0,1)
 BEACONS = np.array([
     [-12.0,    12.0,  0.0],  
     [-12.0,   -12.0,  12.0],
-    #[12.0,  -12.0,  7.0],
+    [12.0,  -12.0,  7.0],
     #[  0.0,  -8.3, 25.0],  # new high anchor
 ], dtype=float)
 
