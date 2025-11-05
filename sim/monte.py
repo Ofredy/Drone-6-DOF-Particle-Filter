@@ -8,6 +8,7 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (needed for 3D projection)
 
 from system_model import *
 import particle_filter
+import firefly_pf
 
 
 # =========================
@@ -514,6 +515,8 @@ if __name__ == "__main__":
     monte_data = generate_trajectories()
     #plot_trajectories(monte_data, fig_num=1, save_as_png=False, dpi=300)
 
-    monte_data = particle_filter.run_pf_for_all_runs(monte_data)
+    #monte_data = particle_filter.run_pf_for_all_runs(monte_data)
+
+    monte_data = firefly_pf.run_firefly_for_all_runs(monte_data, sim_hz)
     plot_pf_state_errors_all_runs(monte_data)
     #plot_pf_weight_pdfs_vs_time(monte_data, run_idx=0)
