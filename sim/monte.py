@@ -17,7 +17,7 @@ import firefly_pf
 np.random.seed(69)
 
 # Monte Carlo
-NUM_MONTE_RUNS = 100
+NUM_MONTE_RUNS = 1
 
 sim_time = 50  # seconds
 sim_hz = 200   # integrator rate (dt = 1/simulation_hz)

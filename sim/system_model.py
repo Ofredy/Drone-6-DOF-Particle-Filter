@@ -13,7 +13,12 @@ measurement_noise_variance = np.sqrt(measurement_noise_std)
 # Rates
 imu_hz = 50        # IMU update/logging rate (can be different from integrator)
 pf_dt = 1 / imu_hz
-ranging_hz = 10
+ranging_hz = 20
+
+# Firefly Algo Rates
+firefly_imu_hz = 50        # IMU update/logging rate (can be different from integrator)
+firefly_pf_dt = 1 / imu_hz
+firefly_ranging_hz = 20
 
 # Beacons
 CENTER = np.array([0.0,  0.0,  1.0]) # central of drone movement(0,0,1)
@@ -21,13 +26,18 @@ BEACONS = np.array([
     [-12.0,    12.0,  0.0],  
     [-12.0,   -12.0,  12.0],
     [12.0,  -12.0,  7.0],
-    #[  0.0,  -8.3, 25.0],  # new high anchor
+], dtype=float)
+
+# Beacons
+FIREFLY_BEACONS = np.array([
+    [-12.0,    12.0,  0.0],  
+    [-12.0,   -12.0,  12.0],
 ], dtype=float)
 
 # Indoor Space Definition
-X_LIM = [ -12.0, 12.0 ]
-Y_LIM = [ -12.0, 12.0 ]
-Z_LIM = [   0.0, 12.0 ]
+X_LIM = [ -15.0, 15.0 ]
+Y_LIM = [ -15.0, 15.0 ]
+Z_LIM = [   0.0, 15.0 ]
 
 A = np.array([
                 [1, 0, 0, pf_dt,      0,      0],
